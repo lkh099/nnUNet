@@ -288,11 +288,15 @@ class ExperimentPlanner(object):
                 'n_conv_per_stage_decoder': self.UNet_blocks_per_stage_decoder[:num_stages - 1],
                 'conv_bias': True,
                 'norm_op': norm.__module__ + '.' + norm.__name__,
-                'norm_op_kwargs': {'eps': 1e-5, 'affine': True},
+                # fixed for FPGA-aware training
+                #'norm_op_kwargs': {'eps': 1e-5, 'affine': True},
+                'norm_op_kwargs': {'track_running_stats':True,'eps': 1e-5, 'affine': True},
                 'dropout_op': None,
                 'dropout_op_kwargs': None,
                 'nonlin': 'torch.nn.LeakyReLU',
-                'nonlin_kwargs': {'inplace': True},
+                # fixed for FPGA-aware training
+                #'nonlin_kwargs': {'inplace': True},
+                'nonlin_kwargs': {'negative_slope': 0.125, 'inplace': True},
             },
             '_kw_requires_import': ('conv_op', 'norm_op', 'dropout_op', 'nonlin'),
         }

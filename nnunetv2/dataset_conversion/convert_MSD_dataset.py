@@ -128,4 +128,6 @@ def entry_point():
 
 
 if __name__ == '__main__':
-    convert_msd_dataset('/home/fabian/Downloads/Task05_Prostate', overwrite_target_id=201)
+    convert_msd_dataset('/DATA/lkh099/MSD/task01_brain/Task01_BrainTumour')#, overwrite_target_id=201)
+    convert_msd_dataset('/DATA/lkh099/MSD/task03_liver/Task03_Liver')#, overwrite_target_id=201)
+    convert_msd_dataset('/DATA/lkh099/MSD/task06_lung/Task06_Lung')#, overwrite_target_id=201)

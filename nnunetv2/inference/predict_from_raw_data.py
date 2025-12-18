@@ -5,6 +5,7 @@ import os
 from copy import deepcopy
 from queue import Queue
 from threading import Thread
+import time
 from time import sleep
 from typing import Tuple, Union, List, Optional
 
@@ -36,6 +37,9 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, Config
 from nnunetv2.utilities.utils import create_lists_from_splitted_dataset_folder
 
 
+from .binary_quantization import ConvOp, flatten_network, save_model, load_model, forward, compute_dice, print_quant_summary
+
+
 class nnUNetPredictor(object):
     def __init__(self,
                  tile_step_size: float = 0.5,
@@ -63,6 +67,98 @@ class nnUNetPredictor(object):
             perform_everything_on_device = False
         self.device = device
         self.perform_everything_on_device = perform_everything_on_device
+        #-----------------------------
+        # custom model forward hooks
+        #-----------------------------
+        self.activation_stats = {}
+
+
+        self.latency_buckets = {
+            "GEMM": [],
+            "Nonlinear": [],
+            "Pool": [],
+            "SoftmaxNorm": [],
+            "OtherNorm": [],
+            "Memory": [],
+            "Arithmetic": [],
+            "Other": [],
+        }
+    
+        self.start_times = {}
+
+    def classify(self, m):
+
+        if isinstance(m, (nn.Conv2d, nn.Conv3d, nn.ConvTranspose3d, nn.ConvTranspose2d, nn.Linear)):
+            return "GEMM"
+
+        if isinstance(m, (nn.ReLU, nn.LeakyReLU, nn.GELU, nn.Sigmoid, nn.SiLU)):
+            return "Nonlinear"
+
+        if isinstance(m, (nn.MaxPool2d, nn.MaxPool3d, nn.AvgPool2d, nn.AvgPool3d,
+                        nn.AdaptiveAvgPool2d, nn.AdaptiveAvgPool3d)):
+            return "Pool"
+
+        if isinstance(m, (nn.LayerNorm, nn.InstanceNorm2d, nn.InstanceNorm3d)):
+            return "SoftmaxNorm"
+
+        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d)):
+            return "OtherNorm"
+
+        # Memory ops cannot be captured by module hooks (cat, add)
+        # They must use monkey-patching, we can add later.
+        return None
+
+    def pre_hook(self, module, inputs):
+        self.start_times[module] = time.time()
+
+    def post_hook(self, module, inputs, output):
+        if module not in self.start_times:
+            return
+        elapsed = time.time() - self.start_times.pop(module, None)
+        bucket = self.classify(module)
+        self.latency_buckets[bucket].append(elapsed)
+    
+    def register_latency_hooks(self, model):
+        for m in model.modules():
+            if self.classify(m) is not None:
+                m.register_forward_pre_hook(self.pre_hook)
+                m.register_forward_hook(self.post_hook)
+
+    def record_activations(self, idx):
+        def hook(module, input, output):
+            # output is the activation tensor
+            act = output.detach()
+            min_val = act.min().item()
+            max_val = act.max().item()
+
+            if idx not in self.activation_stats:
+                self.activation_stats[idx] = {"min": min_val, "max": max_val}
+            else:
+                self.activation_stats[idx]["min"] = min(self.activation_stats[idx]["min"], min_val)
+                self.activation_stats[idx]["max"] = max(self.activation_stats[idx]["max"], max_val)
+        return hook
+
+    def register_activation_stat_hooks(self, model):
+        encoder = model.encoder
+        decoder = model.decoder
+        act_idx = 0
+        for stage_idx, encoder_stage in enumerate(encoder.stages):
+            for blocks_idx, stacked_conv_blocks in enumerate(encoder_stage):
+                for idx, convdropoutnormrelu in enumerate(stacked_conv_blocks.convs):
+                    convdropoutnormrelu.register_forward_hook(self.record_activations(act_idx))
+                    act_idx+=1
+        for s in range(len(decoder.stages)):
+            conv_transpose = decoder.transpconvs[s]
+            conv_transpose.register_forward_hook(self.record_activations(act_idx))
+            act_idx += 1
+            for idx, conv in enumerate(decoder.stages[s].convs):
+                conv.register_forward_hook(self.record_activations(act_idx))
+                act_idx += 1
+            if s == len(decoder.stages) - 1:
+                seg_head = decoder.seg_layers[-1]
+                seg_head.register_forward_hook(self.record_activations(act_idx))
+                act_idx += 1
+        #register_forward_hook(
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
@@ -110,6 +206,15 @@ class nnUNetPredictor(object):
             enable_deep_supervision=False
         )
 
+        print("=== MODEL ARCHITECTURE ===")
+        print(network)
+        print("==========================")
+        from torchviz import make_dot
+        network.cuda()
+        network.eval()
+        y = network(torch.randn(1, 4, 128, 128, 128).cuda())
+        make_dot(y, params=dict(network.named_parameters())).render("network", format="png")
+
         self.plans_manager = plans_manager
         self.configuration_manager = configuration_manager
         self.list_of_parameters = parameters
@@ -123,6 +228,14 @@ class nnUNetPredictor(object):
         self.trainer_name = trainer_name
         self.allowed_mirroring_axes = inference_allowed_mirroring_axes
         self.label_manager = plans_manager.get_label_manager(dataset_json)
+
+        # Register hooks for all Conv/Linear layers
+        # for name, module in network.named_modules():
+        #     if isinstance(module, (nn.Conv2d, nn.Conv3d, nn.ConvTranspose3d, nn.ConvTranspose2d, nn.Linear, nn.ReLU,nn.LeakyReLU, nn.BatchNorm2d, nn.BatchNorm3d)):
+        #         module.register_forward_hook(self.record_activations(name))
+        self.register_activation_stat_hooks(network)
+        self.register_latency_hooks(network)
+
         if ('nnUNet_compile' in os.environ.keys()) and (os.environ['nnUNet_compile'].lower() in ('true', '1', 't')) \
                 and not isinstance(self.network, OptimizedModule):
             print('Using torch.compile')
@@ -355,6 +468,10 @@ class nnUNetPredictor(object):
         each element returned by data_iterator must be a dict with 'data', 'ofile' and 'data_properties' keys!
         If 'ofile' is None, the result will be returned instead of written to a file
         """
+        minimum = 2**30
+        maximum = -2**30
+
+        reference_outputs = []
         with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
             worker_list = [i for i in export_pool._pool]
             r = []
@@ -385,6 +502,12 @@ class nnUNetPredictor(object):
                 # convert to numpy to prevent uncatchable memory alignment errors from multiprocessing serialization of torch tensors
                 prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
 
+                 # save reference output
+                reference_outputs.append({
+                    "key": ofile if ofile is not None else "dummy_key",
+                    "logits": prediction.copy(),   # keep torch tensor
+                    "properties": properties
+                })
                 if ofile is not None:
                     print('sending off prediction to background worker for resampling and export')
                     r.append(
@@ -409,6 +532,21 @@ class nnUNetPredictor(object):
                     print(f'done with {os.path.basename(ofile)}')
                 else:
                     print(f'\nDone with image of shape {data.shape}:')
+                #-----------------------------
+                #debug print
+                #--------------------------------------
+                # print("activation min/max : ")
+                # print(self.activation_stats)
+                # print("Ops Stats : ")
+                # print({k: sum(v) for k, v in self.latency_buckets.items()})
+                #------------------------------------
+                ifm_min, ifm_max = torch.aminmax(data)
+                ifm_min = ifm_min.item()
+                ifm_max = ifm_max.item()
+                if ifm_min < minimum:
+                    minimum = ifm_min
+                if ifm_max > maximum:
+                    maximum = ifm_max
             ret = [i.get()[0] for i in r]
 
         if isinstance(data_iterator, MultiThreadedAugmenter):
@@ -418,6 +556,50 @@ class nnUNetPredictor(object):
         compute_gaussian.cache_clear()
         # clear device cache
         empty_cache(self.device)
+
+        ops, ifm_scale, ifm_bias, seg_scale, seg_bias, _ = flatten_network(self.network, minimum, maximum, self.activation_stats)
+        save_model(ops, ifm_scale, ifm_bias, seg_scale, seg_bias)
+        # need some way to compare dice score, etc... with original model here. how to fetch ifm again?
+        quant_outputs = []
+        metrics = []
+        data_iterator_q = deepcopy(data_iterator)  # or re-create via nnUNet API
+        for idx, preprocessed in enumerate(data_iterator_q):
+            data = preprocessed['data']
+            if isinstance(data, str):
+                delfile = data
+                data = torch.from_numpy(np.load(data))
+                os.remove(delfile)
+
+            # quantized forward
+            q_logits = forward(
+                data,
+                ops,
+                ifm_scale,
+                ifm_bias,
+                seg_scale,
+                seg_bias
+            )
+
+            quant_outputs.append(q_logits)
+
+            # compare with reference
+            ref = reference_outputs[idx]["logits"]
+
+            # example metrics
+            l2 = torch.mean((q_logits.float() - ref.float()) ** 2).item()
+            l1 = torch.mean(torch.abs(q_logits.float() - ref.float())).item()
+
+            metrics.append({
+                "key": reference_outputs[idx]["key"],
+                "l1": l1,
+                "l2": l2
+            })
+        ref_seg = torch.argmax(ref, dim=0)
+        q_seg   = torch.argmax(q_logits, dim=0)
+
+        dice = compute_dice(ref_seg, q_seg)
+        metrics[-1]["dice"] = dice
+        print_quant_summary(metrics)
         return ret
 
     def predict_single_npy_array(self, input_image: np.ndarray, image_properties: dict,
@@ -859,13 +1041,24 @@ def predict_entry_point_modelfolder():
                                 allow_tqdm=not args.disable_progress_bar,
                                 verbose_preprocessing=args.verbose)
     predictor.initialize_from_trained_model_folder(args.m, args.f, args.chk)
+
+    # orig_add = torch.add
+
+    # def timed_add(*args, **kwargs):
+    #     start = time.time()
+    #     out = orig_add(*args, **kwargs)
+    #     predictor.latency_buckets["Arithmetic"] += time.time() - start
+    #     return out
+
+    # torch.add = timed_add
+
     predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
                                  overwrite=not args.continue_prediction,
                                  num_processes_preprocessing=args.npp,
                                  num_processes_segmentation_export=args.nps,
                                  folder_with_segs_from_prev_stage=args.prev_stage_predictions,
                                  num_parts=1, part_id=0)
-
+    
 
 def predict_entry_point():
     import argparse
